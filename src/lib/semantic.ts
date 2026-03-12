@@ -16,9 +16,10 @@ import {
   updateSemanticQueueState
 } from "./db";
 import { categorizeText, extractKeywords } from "./categorize";
-import { filterByCategories, scoreTextMatch } from "./search";
+import { filterByStructuredQuery, scoreTextMatch } from "./search";
 
 const MODEL_ID = "Xenova/all-MiniLM-L6-v2";
+const ANSWER_MODEL_ID = "onnx-community/Qwen2.5-0.5B-Instruct";
 const BATCH_SIZE = 4;
 const MAX_SEMANTIC_RERANK = 120;
 const MIN_QUERY_LENGTH_FOR_SEMANTIC = 3;
@@ -31,6 +32,12 @@ const TOPIC_PROMPTS = {
   evals: "evaluations, benchmarks, judges, test sets, hallucination checks, quality measurement, grading models",
   infra: "inference infrastructure, webgpu, onnx, wasm, runtime performance, latency, throughput, gpu serving, memory",
   product: "product strategy, growth, distribution, positioning, onboarding, pricing, retention, customer research",
+  business: "business strategy, company building, revenue, sales, operations, enterprise, management, founder lessons",
+  marketing: "marketing, branding, audience growth, campaigns, seo, content distribution, newsletters, copywriting",
+  finance: "finance, investing, stocks, valuation, economy, macro trends, money, personal finance",
+  career: "career growth, hiring, interviews, leadership, management, mentorship, promotions, job search",
+  writing: "writing, essays, storytelling, communication, blogging, editing, clear thinking, copy",
+  health: "health, wellness, fitness, sleep, recovery, nutrition, exercise, mental health",
   design: "design systems, interface design, ux, ui, typography, layouts, prototypes, interaction design"
 } as const;
 
@@ -39,9 +46,20 @@ type FeatureExtractor = (input: string | string[], options: { pooling: "mean"; n
   dims: number[];
 }>;
 
+type TextGenerator = (
+  input: string,
+  options: {
+    max_new_tokens: number;
+    temperature: number;
+    do_sample: boolean;
+    return_full_text: boolean;
+  }
+) => Promise<Array<{ generated_text?: string }>>;
+
 let extractorPromise: Promise<FeatureExtractor> | null = null;
 let workerPromise: Promise<SemanticIndexState> | null = null;
 let topicVectorPromise: Promise<Map<string, number[]>> | null = null;
+let generatorPromise: Promise<TextGenerator> | null = null;
 
 async function getExtractor(): Promise<FeatureExtractor> {
   if (!extractorPromise) {
@@ -95,6 +113,60 @@ async function getExtractor(): Promise<FeatureExtractor> {
   }
 
   return extractorPromise;
+}
+
+async function getGenerator(): Promise<TextGenerator> {
+  if (!generatorPromise) {
+    generatorPromise = (async () => {
+      const transformers = (await import("@huggingface/transformers")) as unknown as {
+        env: {
+          allowLocalModels: boolean;
+          allowRemoteModels: boolean;
+          useBrowserCache: boolean;
+          backends: {
+            onnx: {
+              wasm: {
+                wasmPaths?:
+                  | string
+                  | {
+                      mjs: string;
+                      wasm: string;
+                    };
+                proxy?: boolean;
+                numThreads?: number;
+              };
+            };
+          };
+        };
+        pipeline: (
+          task: string,
+          model: string,
+          options: { device: "webgpu" | "wasm"; dtype: "q4" | "q8" }
+        ) => Promise<TextGenerator>;
+      };
+      const { pipeline, env } = transformers;
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+      env.useBrowserCache = true;
+      env.backends.onnx.wasm.wasmPaths = getOnnxWasmPaths();
+      env.backends.onnx.wasm.proxy = false;
+      env.backends.onnx.wasm.numThreads = 1;
+
+      try {
+        return await pipeline("text-generation", ANSWER_MODEL_ID, {
+          device: getPreferredDevice(),
+          dtype: "q4"
+        });
+      } catch {
+        return await pipeline("text-generation", ANSWER_MODEL_ID, {
+          device: "wasm",
+          dtype: "q4"
+        });
+      }
+    })();
+  }
+
+  return generatorPromise;
 }
 
 export function getPreferredDevice(): "webgpu" | "wasm" {
@@ -157,6 +229,9 @@ function buildQueryEmbeddingText(query: SearchQuery, inferredCategories: string[
   const parts = [query.text.trim()];
   if (query.categories.length > 0) {
     parts.push(`categories: ${query.categories.join(" ")}`);
+  }
+  if (query.authorHandles && query.authorHandles.length > 0) {
+    parts.push(`authors: ${query.authorHandles.join(" ")}`);
   }
   if (inferredCategories.length > 0) {
     parts.push(`topics: ${inferredCategories.join(" ")}`);
@@ -266,6 +341,82 @@ async function inferSemanticTopicsFromVector(vector: number[]): Promise<string[]
     .map((entry) => entry.topic);
 }
 
+function buildEvidenceSummary(top: SearchResult[]): string[] {
+  return top.slice(0, 3).map((tweet) => {
+    const snippet = tweet.text.replace(/\s+/g, " ").trim().slice(0, 180);
+    const reasons = tweet.whyMatched?.slice(0, 2).join(", ");
+    return `- @${tweet.authorHandle}: ${snippet}${tweet.text.length > 180 ? "..." : ""}${reasons ? ` (${reasons})` : ""}`;
+  });
+}
+
+function buildFallbackAnswer(top: SearchResult[], topThemes: string[]): string {
+  const answerParts = [
+    topThemes.length > 0
+      ? `Summary: your likes cluster mostly around ${topThemes.join(", ")}.`
+      : "Summary: your likes contain related matches, but no dominant topic cluster yet.",
+    `Signals: strongest evidence comes from ${top
+      .slice(0, 3)
+      .map((tweet) => `@${tweet.authorHandle}`)
+      .join(", ")}.`,
+    "Evidence:",
+    ...buildEvidenceSummary(top)
+  ];
+
+  return answerParts.join("\n");
+}
+
+function buildGeneratorPrompt(query: SearchQuery, top: SearchResult[], topThemes: string[]): string {
+  const citations = top
+    .slice(0, 4)
+    .map((tweet, index) => {
+      const reasons = tweet.whyMatched?.join(", ") ?? "retrieved match";
+      return `[${index + 1}] author=@${tweet.authorHandle}
+categories=${tweet.categories.join(", ")}
+reason=${reasons}
+text=${tweet.text.replace(/\s+/g, " ").trim()}`;
+    })
+    .join("\n\n");
+
+  return `You answer questions about a user's liked tweets.
+Use only the evidence provided.
+Do not invent facts.
+Be concise.
+If the evidence is weak, say so.
+
+Question:
+${query.text || "Summarize the retrieved likes."}
+
+Themes:
+${topThemes.join(", ") || "none"}
+
+Evidence:
+${citations}
+
+Return a short answer with this structure:
+Summary: ...
+Signals: ...
+Evidence:
+- ...
+- ...`;
+}
+
+async function generateGroundedAnswer(query: SearchQuery, top: SearchResult[], topThemes: string[]): Promise<string | null> {
+  try {
+    const generator = await getGenerator();
+    const prompt = buildGeneratorPrompt(query, top, topThemes);
+    const output = await generator(prompt, {
+      max_new_tokens: 220,
+      temperature: 0.2,
+      do_sample: false,
+      return_full_text: false
+    });
+    const text = output?.[0]?.generated_text?.trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function askLikes(
   tweets: LikedTweet[],
   query: SearchQuery
@@ -273,6 +424,7 @@ export async function askLikes(
   answer: string;
   citations: SearchResult[];
   semanticState: SemanticIndexState;
+  answerSource: "model" | "fallback";
 }> {
   const { results, semanticState } = await hybridSearchLikes(tweets, query);
   const top = results.slice(0, 5);
@@ -281,7 +433,8 @@ export async function askLikes(
     return {
       answer: "I could not find strong matches in your liked tweets for that question.",
       citations: [],
-      semanticState
+      semanticState,
+      answerSource: "fallback"
     };
   }
 
@@ -302,28 +455,14 @@ export async function askLikes(
     .slice(0, 3)
     .map(([theme]) => theme);
 
-  const evidenceLines = top.slice(0, 3).map((tweet) => {
-    const snippet = tweet.text.replace(/\s+/g, " ").trim().slice(0, 180);
-    const reasons = tweet.whyMatched?.slice(0, 2).join(", ");
-    return `- @${tweet.authorHandle}: ${snippet}${tweet.text.length > 180 ? "..." : ""}${reasons ? ` (${reasons})` : ""}`;
-  });
-
-  const answerParts = [
-    topThemes.length > 0
-      ? `Summary: your likes cluster mostly around ${topThemes.join(", ")}.`
-      : "Summary: your likes contain related matches, but no dominant topic cluster yet.",
-    `Signals: strongest evidence comes from ${top
-      .slice(0, 3)
-      .map((tweet) => `@${tweet.authorHandle}`)
-      .join(", ")}.`,
-    "Evidence:",
-    ...evidenceLines
-  ];
+  const generated = await generateGroundedAnswer(query, top, topThemes);
+  const answer = generated ?? buildFallbackAnswer(top, topThemes);
 
   return {
-    answer: answerParts.join("\n"),
+    answer,
     citations: top,
-    semanticState
+    semanticState,
+    answerSource: generated ? "model" : "fallback"
   };
 }
 
@@ -489,7 +628,7 @@ export async function hybridSearchLikes(
   results: SearchResult[];
   semanticState: SemanticIndexState;
 }> {
-  const filtered = filterByCategories(tweets, query.categories);
+  const filtered = filterByStructuredQuery(tweets, query);
   const semanticState = await enqueueMissingEmbeddings(filtered);
   const normalizedQuery = query.text.trim();
   const inferredCategories = normalizedQuery ? categorizeText(normalizedQuery).filter((value) => value !== "uncategorized") : [];

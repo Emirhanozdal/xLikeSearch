@@ -1,5 +1,31 @@
 import type { LikedTweet, SearchQuery, SearchResult } from "../types";
 
+export function parseSearchQuery(raw: string, selectedCategories: SearchQuery["categories"]): SearchQuery {
+  const authorHandles = Array.from(
+    new Set(
+      Array.from(raw.matchAll(/@([A-Za-z0-9_]+)/g)).map((match) => match[1].toLowerCase())
+    )
+  );
+
+  const dateFromMatch = raw.match(/\b(?:from|since|after):(\d{4}-\d{2}-\d{2})\b/i);
+  const dateToMatch = raw.match(/\b(?:to|until|before):(\d{4}-\d{2}-\d{2})\b/i);
+
+  const cleaned = raw
+    .replace(/@([A-Za-z0-9_]+)/g, " ")
+    .replace(/\b(?:from|since|after):\d{4}-\d{2}-\d{2}\b/gi, " ")
+    .replace(/\b(?:to|until|before):\d{4}-\d{2}-\d{2}\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    text: cleaned,
+    categories: selectedCategories,
+    authorHandles,
+    dateFrom: dateFromMatch?.[1],
+    dateTo: dateToMatch?.[1]
+  };
+}
+
 export function scoreTextMatch(tweet: LikedTweet, query: string): number {
   const normalizedQuery = query.trim().toLowerCase();
 
@@ -80,4 +106,33 @@ export function filterByCategories(tweets: LikedTweet[], categories: SearchQuery
   }
 
   return tweets.filter((tweet) => categories.every((category) => tweet.categories.includes(category)));
+}
+
+export function filterByStructuredQuery(tweets: LikedTweet[], query: SearchQuery): LikedTweet[] {
+  return tweets.filter((tweet) => {
+    if (query.categories.length > 0 && !query.categories.every((category) => tweet.categories.includes(category))) {
+      return false;
+    }
+
+    if (query.authorHandles && query.authorHandles.length > 0) {
+      const authorPool = [
+        tweet.authorHandle,
+        tweet.originalTweet.authorHandle,
+        tweet.quotedTweet?.authorHandle ?? ""
+      ].map((value) => value.toLowerCase());
+      if (!query.authorHandles.some((handle) => authorPool.includes(handle))) {
+        return false;
+      }
+    }
+
+    const createdAt = tweet.createdAt ? new Date(tweet.createdAt).getTime() : undefined;
+    if (query.dateFrom && createdAt !== undefined && createdAt < new Date(query.dateFrom).getTime()) {
+      return false;
+    }
+    if (query.dateTo && createdAt !== undefined && createdAt > new Date(query.dateTo).getTime()) {
+      return false;
+    }
+
+    return true;
+  });
 }

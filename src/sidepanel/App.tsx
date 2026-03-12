@@ -16,6 +16,7 @@ import type {
   SyncContext,
   TweetCategory
 } from "../types";
+import { parseSearchQuery } from "../lib/search";
 
 const CATEGORY_OPTIONS: TweetCategory[] = [
   "rag",
@@ -24,8 +25,30 @@ const CATEGORY_OPTIONS: TweetCategory[] = [
   "evals",
   "infra",
   "product",
+  "business",
+  "marketing",
+  "finance",
+  "career",
+  "writing",
+  "health",
   "design",
   "uncategorized"
+];
+
+interface SavedView {
+  id: string;
+  name: string;
+  query: string;
+  categories: TweetCategory[];
+}
+
+const PRESET_QUERIES: Array<{ label: string; query: string; categories: TweetCategory[] }> = [
+  { label: "Career", query: "career", categories: ["career"] },
+  { label: "Finance", query: "finance", categories: ["finance"] },
+  { label: "Health", query: "health", categories: ["health"] },
+  { label: "Writing", query: "writing", categories: ["writing"] },
+  { label: "Design", query: "design", categories: ["design"] },
+  { label: "Product", query: "product", categories: ["product"] }
 ];
 
 type SemanticModule = typeof import("../lib/semantic");
@@ -79,6 +102,7 @@ const DEFAULT_TELEMETRY: ImportTelemetry = {
 
 type SortOption = "relevance" | "newest" | "oldest" | "captured-newest" | "captured-oldest" | "author";
 const SORT_STORAGE_KEY = "x-like-search-sort";
+const SAVED_VIEWS_STORAGE_KEY = "x-like-search-saved-views";
 
 export function App() {
   const [tweets, setTweets] = useState<LikedTweet[]>([]);
@@ -108,6 +132,11 @@ export function App() {
   const [askAnswer, setAskAnswer] = useState("");
   const [askCitations, setAskCitations] = useState<SearchResult[]>([]);
   const [isAsking, setIsAsking] = useState(false);
+  const [askAnswerSource, setAskAnswerSource] = useState<"model" | "fallback" | null>(null);
+  const [savedViews, setSavedViews] = useState<SavedView[]>(() => {
+    const stored = window.localStorage.getItem(SAVED_VIEWS_STORAGE_KEY);
+    return stored ? (JSON.parse(stored) as SavedView[]) : [];
+  });
   const autoSyncStartedRef = useRef(false);
   const importHeadline = useMemo(
     () => buildImportHeadline(importState, semanticState, storageStats.totalLikes),
@@ -164,6 +193,10 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem(SORT_STORAGE_KEY, sortBy);
   }, [sortBy]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(savedViews));
+  }, [savedViews]);
 
   function hydrateSnapshot(snapshot: StateSnapshot) {
     if (snapshot.importState) {
@@ -330,14 +363,12 @@ export function App() {
 
     try {
       const semantic = await getSemanticModule();
-      const { results: nextResults, semanticState: nextState } = await semantic.hybridSearchLikes(tweets, {
-        text: query,
-        categories: selectedCategories
-      });
+      const parsedQuery = parseSearchQuery(query, selectedCategories);
+      const { results: nextResults, semanticState: nextState } = await semantic.hybridSearchLikes(tweets, parsedQuery);
       setResults(nextResults);
       setSemanticState(nextState);
       setStatus(
-        query.trim()
+        parsedQuery.text.trim() || (parsedQuery.authorHandles?.length ?? 0) > 0 || parsedQuery.dateFrom || parsedQuery.dateTo
           ? `${nextResults.length} results ranked.`
           : `${nextResults.length} items available.`
       );
@@ -360,18 +391,24 @@ export function App() {
     setIsAsking(true);
     try {
       const semantic = await getSemanticModule();
-      const { answer, citations, semanticState: nextState } = await semantic.askLikes(tweets, {
-        text: normalized,
-        categories: selectedCategories
+      const parsedQuery = parseSearchQuery(askQuery, selectedCategories);
+      const { answer, citations, semanticState: nextState, answerSource } = await semantic.askLikes(tweets, {
+        text: parsedQuery.text || normalized,
+        categories: parsedQuery.categories,
+        authorHandles: parsedQuery.authorHandles,
+        dateFrom: parsedQuery.dateFrom,
+        dateTo: parsedQuery.dateTo
       });
       setSemanticState(nextState);
       setAskAnswer(answer);
       setAskCitations(citations);
+      setAskAnswerSource(answerSource);
       setStatus(`Answered from ${citations.length} retrieved likes.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Ask mode failed.";
       setAskAnswer(message);
       setAskCitations([]);
+      setAskAnswerSource(null);
       setStatus(message);
     } finally {
       setIsAsking(false);
@@ -420,6 +457,38 @@ export function App() {
     const filename = `x-like-archive-${scope}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.${format}`;
     downloadText(content, mime, filename);
     setStatus(`Exported ${exportSet.length} likes as ${format.toUpperCase()}.`);
+  }
+
+  function applyPreset(queryValue: string, categories: TweetCategory[]) {
+    setQuery(queryValue);
+    setSelectedCategories(categories);
+  }
+
+  function saveCurrentView() {
+    const trimmed = query.trim();
+    if (!trimmed && selectedCategories.length === 0) {
+      setStatus("Add a query or category before saving a view.");
+      return;
+    }
+
+    const nextView: SavedView = {
+      id: crypto.randomUUID(),
+      name: trimmed || selectedCategories.join(", "),
+      query: query,
+      categories: selectedCategories
+    };
+    setSavedViews((current) => [nextView, ...current].slice(0, 8));
+    setStatus(`Saved view: ${nextView.name}`);
+  }
+
+  function loadSavedView(view: SavedView) {
+    setQuery(view.query);
+    setSelectedCategories(view.categories);
+    setStatus(`Loaded saved view: ${view.name}`);
+  }
+
+  function removeSavedView(id: string) {
+    setSavedViews((current) => current.filter((view) => view.id !== id));
   }
 
   return (
@@ -516,12 +585,22 @@ export function App() {
                     <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9ca3af]" />
                     <Input
                       className="pl-9"
-                      placeholder="keyword, author, topic"
+                      placeholder="keyword, @author, from:2025-01-01, to:2025-12-31"
                       value={query}
                       onChange={(event) => setQuery(event.target.value)}
                     />
                   </div>
                   <div className="flex flex-wrap gap-2">
+                    {PRESET_QUERIES.map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        className="rounded-md border border-[#d1d5db] bg-[#f9fafb] px-2.5 py-1 text-xs font-medium text-[#374151] hover:border-[#9ca3af]"
+                        onClick={() => applyPreset(preset.query, preset.categories)}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
                     {CATEGORY_OPTIONS.map((category) => (
                       <button
                         key={category}
@@ -537,6 +616,41 @@ export function App() {
                       </button>
                     ))}
                   </div>
+                  <div className="flex items-center justify-between gap-3 rounded-lg border border-[#e5e7eb] bg-[#fafafa] px-3 py-2">
+                    <div className="min-w-0 text-xs text-[#6b7280]">
+                      Save common filters and reuse them as quick views.
+                    </div>
+                    <Button size="sm" variant="secondary" onClick={saveCurrentView}>
+                      Save view
+                    </Button>
+                  </div>
+                  {savedViews.length > 0 ? (
+                    <div className="space-y-2">
+                      <label className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6b7280]">
+                        Saved views
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        {savedViews.map((view) => (
+                          <div key={view.id} className="inline-flex items-center rounded-md border border-[#d1d5db] bg-white">
+                            <button
+                              type="button"
+                              className="px-2.5 py-1 text-xs font-medium text-[#374151]"
+                              onClick={() => loadSavedView(view)}
+                            >
+                              {view.name}
+                            </button>
+                            <button
+                              type="button"
+                              className="border-l border-[#e5e7eb] px-2 py-1 text-xs text-[#9ca3af] hover:text-[#111827]"
+                              onClick={() => removeSavedView(view.id)}
+                            >
+                              x
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                   <div className="grid gap-3 md:grid-cols-[160px_1fr]">
                     <div className="space-y-1">
                       <label className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6b7280]">
@@ -585,7 +699,7 @@ export function App() {
                     </div>
                     <div className="flex gap-2">
                       <Input
-                        placeholder="What have I liked about RAG, evals, or agents?"
+                        placeholder="What did I like about career, finance, or health from @someone?"
                         value={askQuery}
                         onChange={(event) => setAskQuery(event.target.value)}
                       />
@@ -595,6 +709,11 @@ export function App() {
                     </div>
                     {askAnswer ? (
                       <div className="mt-3 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Badge variant={askAnswerSource === "model" ? "accent" : "secondary"}>
+                            {askAnswerSource === "model" ? "AI answer" : "retrieval fallback"}
+                          </Badge>
+                        </div>
                         <div className="rounded-md border border-[#e5e7eb] bg-white p-3">
                           <p className="whitespace-pre-line text-sm leading-6 text-[#111827]">{askAnswer}</p>
                         </div>

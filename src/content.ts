@@ -380,6 +380,12 @@ const CATEGORY_RULES: Record<TweetCategory, string[]> = {
   evals: ["eval", "evals", "evaluation", "benchmark", "judge", "grading", "test set", "leaderboard"],
   infra: ["latency", "gpu", "cuda", "serving", "inference", "throughput", "database", "webgpu", "onnx", "wasm"],
   product: ["growth", "pricing", "market", "launch", "distribution", "saas", "retention", "onboarding"],
+  business: ["business", "company", "revenue", "profit", "sales", "founder", "enterprise", "operations", "strategy"],
+  marketing: ["marketing", "brand", "branding", "seo", "copywriting", "audience", "campaign", "newsletter"],
+  finance: ["finance", "investing", "investment", "stock", "stocks", "valuation", "economy", "macro", "money"],
+  career: ["career", "hiring", "interview", "resume", "job", "promotion", "leadership", "manager", "mentorship"],
+  writing: ["writing", "essay", "storytelling", "copy", "blog", "thread", "editing", "communication"],
+  health: ["health", "fitness", "sleep", "nutrition", "workout", "wellness", "diet", "exercise"],
   design: ["design", "ux", "ui", "prototype", "layout", "visual", "interaction", "typography"],
   uncategorized: []
 };

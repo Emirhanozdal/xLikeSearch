@@ -6,6 +6,12 @@ export type TweetCategory =
   | "infra"
   | "product"
   | "design"
+  | "business"
+  | "marketing"
+  | "finance"
+  | "career"
+  | "writing"
+  | "health"
   | "uncategorized";
 
 export interface TweetEntity {
@@ -45,6 +51,9 @@ export interface LikedTweet {
 export interface SearchQuery {
   text: string;
   categories: TweetCategory[];
+  authorHandles?: string[];
+  dateFrom?: string;
+  dateTo?: string;
 }
 
 export interface SearchResult extends LikedTweet {
